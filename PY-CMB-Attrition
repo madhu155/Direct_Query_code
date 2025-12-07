@@ -1,0 +1,329 @@
+CREATE OR REPLACE TABLE FUNCTION `pulse-dev-477810.KPIs.py_cmb_attrition` (
+  p_gender_type       STRING,
+  p_function_name     STRING,
+  p_department_name   STRING,
+  p_designation_name  STRING,
+  p_location_name     STRING,
+  p_employment_status STRING,
+  p_FY STRING,
+  p_Quarter STRING,
+  p_Month STRING
+)
+RETURNS TABLE<
+  FY                STRING,
+  FY_Attrition      FLOAT64,
+  Quarter           STRING,
+  Quarter_Attrition FLOAT64,
+  Month             STRING,
+  Month_Attrition   FLOAT64,
+  gender_type       STRING,
+  Function_Name     STRING,
+  department_name   STRING,
+  designation_name  STRING,
+  location_name     STRING,
+  employment_status STRING, 
+  Flag  INT64
+>
+AS (
+
+/******************************************************************
+  STEP 0 — MAP PARAMETER VALUES TO DIM IDs
+******************************************************************/
+WITH params AS (
+  SELECT
+    CASE WHEN p_gender_type IS NULL OR p_gender_type = 'All' THEN NULL
+         ELSE (SELECT gender_id FROM `pulse-dev-477810.gold.gl_dim_gender`
+               WHERE gender_type = p_gender_type LIMIT 1) END AS gender_id_param,
+
+    CASE WHEN p_function_name IS NULL OR p_function_name = 'All' THEN NULL
+         ELSE (SELECT function_id FROM `pulse-dev-477810.gold.gl_dim_functions`
+               WHERE function_name = p_function_name LIMIT 1) END AS function_id_param,
+
+    CASE WHEN p_department_name IS NULL OR p_department_name = 'All' THEN NULL
+         ELSE (SELECT department_id FROM `pulse-dev-477810.gold.gl_dim_department`
+               WHERE department_name = p_department_name LIMIT 1) END AS department_id_param,
+
+    CASE WHEN p_designation_name IS NULL OR p_designation_name = 'All' THEN NULL
+         ELSE (SELECT designation_id FROM `pulse-dev-477810.gold.gl_dim_designation`
+               WHERE designation_name = p_designation_name LIMIT 1) END AS designation_id_param,
+
+    CASE WHEN p_location_name IS NULL OR p_location_name = 'All' THEN NULL
+         ELSE (SELECT location_id FROM `pulse-dev-477810.gold.gl_dim_location`
+               WHERE location_name = p_location_name LIMIT 1) END AS location_id_param,
+
+    CASE WHEN p_employment_status IS NULL OR p_employment_status = 'All' THEN NULL
+         ELSE (SELECT employment_status_id
+               FROM `pulse-dev-477810.gold.gl_dim_employment_status`
+               WHERE employment_status = p_employment_status LIMIT 1) END AS employment_status_id_param
+),
+
+/******************************************************************
+  STEP 1 — DISTINCT EMPLOYEE SNAPSHOT
+******************************************************************/
+emp_base AS (
+  SELECT DISTINCT
+    employee_id,
+    gender_id,
+    function_id,
+    department_id,
+    designation_id,
+    location_id,
+    employment_status_id,
+    Joining_Date,
+    Resigned_Date
+  FROM `pulse-dev-477810.gold.gl_fact_employee`
+),
+
+/******************************************************************
+  STEP 2 — APPLY FILTERS (EXCEPT EMPLOYMENT STATUS)
+******************************************************************/
+emp_filtered AS (
+  SELECT e.*
+  FROM emp_base e, params p
+  WHERE (p.gender_id_param      IS NULL OR e.gender_id      = p.gender_id_param)
+    AND (p.function_id_param    IS NULL OR e.function_id    = p.function_id_param)
+    AND (p.department_id_param  IS NULL OR e.department_id  = p.department_id_param)
+    AND (p.designation_id_param IS NULL OR e.designation_id = p.designation_id_param)
+    AND (p.location_id_param    IS NULL OR e.location_id    = p.location_id_param)
+),
+
+/******************************************************************
+  STEP 3 — CALENDAR DIMENSIONS (PFY FILTER APPLIED HERE)
+******************************************************************/
+cutoff AS (
+  SELECT DATE_SUB(LAST_DAY(CURRENT_DATE()), INTERVAL 1 YEAR) AS cutoff_date
+),
+
+month_dim AS (
+  SELECT DISTINCT
+    c.FY,
+    c.Q AS Quarter,
+    c.Month,
+    c.month_start AS period_start,
+    DATE_ADD(c.month_end, INTERVAL 1 DAY) AS period_end_excl
+  FROM `pulse-dev-477810.gold.gl_dim_calendar` c, cutoff k
+  WHERE c.Date IS NOT NULL
+    AND c.is_month_end = TRUE
+    AND c.Date <= k.cutoff_date     -- ★ PFY FILTER
+),
+
+quarter_dim AS (
+  SELECT
+    c.FY,
+    c.Q AS Quarter,
+    MIN(c.month_start) AS period_start,
+    DATE_ADD(MAX(c.month_end), INTERVAL 1 DAY) AS period_end_excl
+  FROM `pulse-dev-477810.gold.gl_dim_calendar` c, cutoff k
+  WHERE c.Date IS NOT NULL
+    AND c.is_month_end = TRUE
+    AND c.Date <= k.cutoff_date     -- ★ PFY FILTER
+  GROUP BY c.FY, Quarter
+),
+
+fy_dim AS (
+  SELECT
+    c.FY,
+    MIN(c.month_start) AS period_start,
+    DATE_ADD(MAX(c.month_end), INTERVAL 1 DAY) AS period_end_excl
+  FROM `pulse-dev-477810.gold.gl_dim_calendar` c, cutoff k
+  WHERE c.Date IS NOT NULL
+    AND c.is_month_end = TRUE
+    AND c.Date <= k.cutoff_date     -- ★ PFY FILTER
+  GROUP BY c.FY
+),
+
+/******************************************************************
+  STEP 4 — PERIOD CALCULATIONS
+******************************************************************/
+month_calc AS (
+  SELECT
+    m.FY,
+    m.Quarter,
+    m.Month,
+    m.period_start,
+    m.period_end_excl,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Joining_Date < m.period_start
+         AND (e.Resigned_Date IS NULL OR e.Resigned_Date >= m.period_start)
+    ) AS start_hc,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Joining_Date >= m.period_start
+         AND e.Joining_Date <  m.period_end_excl
+    ) AS joined_during,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Resigned_Date >= m.period_start
+         AND e.Resigned_Date <  m.period_end_excl
+    ) AS resigned_total,
+
+    (SELECT COUNT(*) FROM emp_filtered e, params p
+       WHERE e.Resigned_Date >= m.period_start
+         AND e.Resigned_Date <  m.period_end_excl
+         AND (p.employment_status_id_param IS NULL
+              OR e.employment_status_id = p.employment_status_id_param)
+    ) AS resigned_filtered
+
+  FROM month_dim m
+),
+
+quarter_calc AS (
+  SELECT
+    q.FY,
+    q.Quarter,
+    q.period_start,
+    q.period_end_excl,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Joining_Date < q.period_start
+         AND (e.Resigned_Date IS NULL OR e.Resigned_Date >= q.period_start)
+    ) AS start_hc,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Joining_Date >= q.period_start
+         AND e.Joining_Date <  q.period_end_excl
+    ) AS joined_during,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Resigned_Date >= q.period_start
+         AND e.Resigned_Date <  q.period_end_excl
+    ) AS resigned_total,
+
+    (SELECT COUNT(*) FROM emp_filtered e, params p
+       WHERE e.Resigned_Date >= q.period_start
+         AND e.Resigned_Date <  q.period_end_excl
+         AND (p.employment_status_id_param IS NULL
+              OR e.employment_status_id = p.employment_status_id_param)
+    ) AS resigned_filtered
+
+  FROM quarter_dim q
+),
+
+fy_calc AS (
+  SELECT
+    f.FY,
+    f.period_start,
+    f.period_end_excl,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Joining_Date < f.period_start
+         AND (e.Resigned_Date IS NULL OR e.Resigned_Date >= f.period_start)
+    ) AS start_hc,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Joining_Date >= f.period_start
+         AND e.Joining_Date <  f.period_end_excl
+    ) AS joined_during,
+
+    (SELECT COUNT(*) FROM emp_filtered e
+       WHERE e.Resigned_Date >= f.period_start
+         AND e.Resigned_Date <  f.period_end_excl
+    ) AS resigned_total,
+
+    (SELECT COUNT(*) FROM emp_filtered e, params p
+       WHERE e.Resigned_Date >= f.period_start
+         AND e.Resigned_Date <  f.period_end_excl
+         AND (p.employment_status_id_param IS NULL
+              OR e.employment_status_id = p.employment_status_id_param)
+    ) AS resigned_filtered
+
+  FROM fy_dim f
+),
+
+/******************************************************************
+  STEP 5 — ATTRITION
+******************************************************************/
+month_attr AS (
+  SELECT
+    FY,
+    Quarter,
+    Month,
+    ROUND(
+      SAFE_DIVIDE(
+        resigned_filtered,
+        (start_hc + (start_hc + joined_during - resigned_total)) / 2.0
+      ) * 100,
+      2
+    ) AS Month_Attrition
+  FROM month_calc
+),
+
+quarter_attr AS (
+  SELECT
+    FY,
+    Quarter,
+    ROUND(
+      SAFE_DIVIDE(
+        resigned_filtered,
+        (start_hc + (start_hc + joined_during - resigned_total)) / 2.0
+      ) * 100,
+      2
+    ) AS Quarter_Attrition
+  FROM quarter_calc
+),
+
+fy_attr AS (
+  SELECT
+    FY,
+    ROUND(
+      SAFE_DIVIDE(
+        resigned_filtered,
+        (start_hc + (start_hc + joined_during - resigned_total)) / 2.0
+      ) * 100,
+      2
+    ) AS FY_Attrition
+  FROM fy_calc
+),
+
+/******************************************************************
+  STEP 6 — FINAL OUTPUT GRID
+******************************************************************/
+final_output AS (
+  SELECT
+    m.FY,
+    f.FY_Attrition,
+    m.Quarter,
+    q.Quarter_Attrition,
+    m.Month,
+    COALESCE(ma.Month_Attrition, 0) AS Month_Attrition,
+    p_gender_type       AS gender_type,
+    p_function_name     AS Function_Name,
+    p_department_name   AS department_name,
+    p_designation_name  AS designation_name,
+    p_location_name     AS location_name,
+    p_employment_status AS employment_status,
+    m.period_start
+  FROM month_dim m
+  LEFT JOIN month_attr   ma ON m.FY = ma.FY AND m.Quarter = ma.Quarter AND m.Month = ma.Month
+  LEFT JOIN fy_attr      f  ON m.FY = f.FY
+  LEFT JOIN quarter_attr q  ON m.FY = q.FY AND m.Quarter = q.Quarter
+),
+
+final AS (
+SELECT *
+FROM final_output
+WHERE 
+      (IFNULL(p_FY, 'All')      = 'All' OR FY      = p_FY)
+  AND (IFNULL(p_Quarter, 'All') = 'All' OR Quarter = p_Quarter)
+  AND (IFNULL(p_Month, 'All')   = 'All' OR Month   = p_Month)
+ORDER BY
+  FY,
+  CASE Quarter WHEN 'Q1' THEN 1 WHEN 'Q2' THEN 2 WHEN 'Q3' THEN 3 WHEN 'Q4' THEN 4 END,
+  period_start
+)
+
+SELECT 
+    f.*,
+    d.Flag AS Flag
+FROM final f
+LEFT JOIN (
+    SELECT DISTINCT
+        FY,
+        Flag
+    FROM `pulse-dev-477810.gold.gl_dim_calendar`
+    WHERE Date IS NOT NULL
+) d
+ON f.FY = d.FY
+
+);
