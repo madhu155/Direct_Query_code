@@ -1,0 +1,373 @@
+CREATE OR REPLACE TABLE FUNCTION `pulse-dev-477810.KPIs.fn_tenure_attrition`
+(
+  p_gender STRING,
+  p_function STRING,
+  p_department STRING,
+  p_designation STRING,
+  p_location STRING,
+  p_employment_status STRING
+)
+RETURNS TABLE<
+  Tenure_Bucket STRING,
+  FY STRING,
+  Quarter STRING,
+  Month_Name STRING,
+
+  FY_Attrition FLOAT64,
+  Quarter_Attrition FLOAT64,
+  Month_Attrition FLOAT64,
+
+  Total_Employees FLOAT64,
+  Total_Resigned_Employee INT64,
+  bucket_attrition FLOAT64,
+
+  Month_Sort INT64,
+
+  gender_type STRING,
+  Function_Name STRING,
+  department_name STRING,
+  designation_name STRING,
+  location_name STRING,
+  employment_status STRING
+>
+AS (
+
+/**************************************************************************
+ STEP 0 — Base table + Filters
+**************************************************************************/
+WITH base AS (
+  SELECT
+    fe.employee_id,
+    fe.joining_date,
+    fe.resigned_date,
+    fe.Year_Bucket AS Tenure_Bucket,
+
+    g.gender_type,
+    fn.Function_Name,
+    d.department_name,
+    ds.designation_name,
+    l.location_name,
+    es.employment_status
+
+  FROM `pulse-dev-477810.gold.gl_fact_employee` fe
+  LEFT JOIN `pulse-dev-477810.gold.gl_dim_gender` g ON fe.gender_id = g.gender_id
+  LEFT JOIN `pulse-dev-477810.gold.gl_dim_functions` fn ON fe.function_id = fn.function_id
+  LEFT JOIN `pulse-dev-477810.gold.gl_dim_department` d ON fe.department_id = d.department_id
+  LEFT JOIN `pulse-dev-477810.gold.gl_dim_designation` ds ON fe.designation_id = ds.designation_id
+  LEFT JOIN `pulse-dev-477810.gold.gl_dim_location` l ON fe.location_id = l.location_id
+  LEFT JOIN `pulse-dev-477810.gold.gl_dim_employment_status` es ON fe.employment_status_id = es.employment_status_id
+
+  WHERE fe.Year_Bucket IS NOT NULL
+    AND fe.Year_Bucket != 'All'
+),
+
+filtered AS (
+  SELECT *
+  FROM base
+  WHERE (p_gender IS NULL OR p_gender='All' OR gender_type=p_gender)
+    AND (p_function IS NULL OR p_function='All' OR Function_Name=p_function)
+    AND (p_department IS NULL OR p_department='All' OR department_name=p_department)
+    AND (p_designation IS NULL OR p_designation='All' OR designation_name=p_designation)
+    AND (p_location IS NULL OR p_location='All' OR location_name=p_location)
+    AND (p_employment_status IS NULL OR p_employment_status='All' OR employment_status=p_employment_status)
+),
+
+/**************************************************************************
+ STEP 1 — Calendar table
+**************************************************************************/
+calendar_bounds AS (
+  SELECT
+    DATE_TRUNC(MIN(joining_date), MONTH) AS cal_start,
+    DATE_TRUNC(MAX(COALESCE(resigned_date, CURRENT_DATE())), MONTH) AS cal_end
+  FROM filtered
+),
+
+calendar_months AS (
+  SELECT
+    m AS month_start,
+    DATE_ADD(m, INTERVAL 1 MONTH) AS month_end,
+    EXTRACT(MONTH FROM m) AS month_num,
+    FORMAT_DATE('%B', m) AS month_name,
+    CASE WHEN EXTRACT(MONTH FROM m) >= 4 THEN EXTRACT(YEAR FROM m)
+         ELSE EXTRACT(YEAR FROM m) - 1 END AS fy_start_year
+  FROM calendar_bounds,
+       UNNEST(GENERATE_DATE_ARRAY(cal_start, cal_end, INTERVAL 1 MONTH)) AS m
+),
+
+calendar AS (
+  SELECT
+    CONCAT(
+      'FY-',
+      LPAD(CAST(MOD(fy_start_year,100) AS STRING),2,'0'),
+      '-',
+      LPAD(CAST(MOD(fy_start_year+1,100) AS STRING),2,'0')
+    ) AS FY,
+    CASE
+      WHEN month_num BETWEEN 4 AND 6 THEN 'Q1'
+      WHEN month_num BETWEEN 7 AND 9 THEN 'Q2'
+      WHEN month_num BETWEEN 10 AND 12 THEN 'Q3'
+      ELSE 'Q4'
+    END AS Quarter,
+    month_start,
+    month_end,
+    month_num,
+    month_name,
+    CASE WHEN month_num BETWEEN 4 AND 12 THEN month_num - 3 ELSE month_num + 9 END AS Month_Sort
+  FROM calendar_months
+),
+
+/**************************************************************************
+ STEP 2 — Distinct buckets (Tenure_Bucket)
+**************************************************************************/
+buckets AS (
+  SELECT DISTINCT Tenure_Bucket FROM filtered
+),
+
+/**************************************************************************
+ STEP 3 — Build grid using LEFT JOIN (NO CROSS JOIN)
+**************************************************************************/
+grid AS (
+  SELECT
+    b.Tenure_Bucket,
+    c.FY,
+    c.Quarter,
+    c.month_start,
+    c.month_end,
+    c.month_name AS Month_Name,
+    c.Month_Sort
+  FROM calendar c
+  LEFT JOIN buckets b ON TRUE
+),
+
+/**************************************************************************
+ STEP 4 — Simple bucket counts
+**************************************************************************/
+simple_counts AS (
+  SELECT
+    Tenure_Bucket,
+    CAST(COUNT(DISTINCT employee_id) AS FLOAT64) AS Total_Employees,
+    COUNT(DISTINCT CASE WHEN resigned_date IS NOT NULL THEN employee_id END)
+        AS Total_Resigned_Employee
+  FROM filtered
+  GROUP BY Tenure_Bucket
+),
+
+/**************************************************************************
+ STEP 5 — Month-level metrics
+**************************************************************************/
+month_metrics AS (
+  SELECT
+    g.Tenure_Bucket,
+    g.FY,
+    g.Quarter,
+    g.Month_Name,
+    g.month_start,
+    g.month_end,
+    g.Month_Sort,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = g.Tenure_Bucket
+        AND e.resigned_date >= g.month_start
+        AND e.resigned_date <  g.month_end
+    ) AS resigned_during_month,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = g.Tenure_Bucket
+        AND e.joining_date >= g.month_start
+        AND e.joining_date <  g.month_end
+    ) AS joined_during_month,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = g.Tenure_Bucket
+        AND e.joining_date < g.month_start
+        AND (e.resigned_date IS NULL OR e.resigned_date >= g.month_start)
+    ) AS start_hc,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = g.Tenure_Bucket
+        AND e.joining_date < g.month_end
+        AND (e.resigned_date IS NULL OR e.resigned_date >= g.month_end)
+    ) AS end_hc
+
+  FROM grid g
+),
+
+month_pct AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(start_hc + end_hc, 2) AS avg_hc,
+
+    CASE
+      WHEN SAFE_DIVIDE(start_hc + end_hc, 2) = 0 THEN NULL
+      ELSE SAFE_DIVIDE(resigned_during_month, SAFE_DIVIDE(start_hc + end_hc, 2))
+    END AS month_attrition_numeric
+  FROM month_metrics
+),
+
+/**************************************************************************
+ STEP 6 — Quarter metrics
+**************************************************************************/
+quarter_periods AS (
+  SELECT
+    FY,
+    Quarter,
+    MIN(month_start) AS quarter_start,
+    MAX(month_end)   AS quarter_end
+  FROM calendar
+  GROUP BY FY, Quarter
+),
+
+quarter_metrics AS (
+  SELECT
+    b.Tenure_Bucket,
+    qp.FY,
+    qp.Quarter,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = b.Tenure_Bucket
+        AND e.resigned_date >= qp.quarter_start
+        AND e.resigned_date <  qp.quarter_end
+    ) AS resigned_during_quarter,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = b.Tenure_Bucket
+        AND e.joining_date < qp.quarter_start
+        AND (e.resigned_date IS NULL OR e.resigned_date >= qp.quarter_start)
+    ) AS start_hc,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = b.Tenure_Bucket
+        AND e.joining_date < qp.quarter_end
+        AND (e.resigned_date IS NULL OR e.resigned_date >= qp.quarter_end)
+    ) AS end_hc
+
+  FROM buckets b
+  LEFT JOIN quarter_periods qp ON TRUE
+),
+
+quarter_pct AS (
+  SELECT
+    Tenure_Bucket,
+    FY,
+    Quarter,
+    CASE WHEN SAFE_DIVIDE(start_hc + end_hc, 2) = 0 THEN NULL
+         ELSE SAFE_DIVIDE(resigned_during_quarter, SAFE_DIVIDE(start_hc + end_hc, 2))
+    END AS quarter_attrition_numeric
+  FROM quarter_metrics
+),
+
+/**************************************************************************
+ STEP 7 — FY metrics
+**************************************************************************/
+fy_periods AS (
+  SELECT
+    FY,
+    MIN(month_start) AS fy_start,
+    MAX(month_end)   AS fy_end
+  FROM calendar
+  GROUP BY FY
+),
+
+fy_metrics AS (
+  SELECT
+    b.Tenure_Bucket,
+    fyp.FY,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = b.Tenure_Bucket
+        AND e.resigned_date >= fyp.fy_start
+        AND e.resigned_date <  fyp.fy_end
+    ) AS resigned_during_fy,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = b.Tenure_Bucket
+        AND e.joining_date < fyp.fy_start
+        AND (e.resigned_date IS NULL OR e.resigned_date >= fyp.fy_start)
+    ) AS start_hc,
+
+    (
+      SELECT COUNT(DISTINCT employee_id)
+      FROM filtered e
+      WHERE e.Tenure_Bucket = b.Tenure_Bucket
+        AND e.joining_date < fyp.fy_end
+        AND (e.resigned_date IS NULL OR e.resigned_date >= fyp.fy_end)
+    ) AS end_hc
+
+  FROM buckets b
+  LEFT JOIN fy_periods fyp ON TRUE
+),
+
+fy_pct AS (
+  SELECT
+    Tenure_Bucket,
+    FY,
+    CASE WHEN SAFE_DIVIDE(start_hc + end_hc, 2) = 0 THEN NULL
+         ELSE SAFE_DIVIDE(resigned_during_fy, SAFE_DIVIDE(start_hc + end_hc, 2))
+    END AS fy_attrition_numeric
+  FROM fy_metrics
+),
+
+/**************************************************************************
+ STEP 8 — Final Output
+**************************************************************************/
+final AS (
+  SELECT
+    g.Tenure_Bucket,
+    g.FY,
+    g.Quarter,
+    g.Month_Name,
+
+    ROUND(COALESCE(fp.fy_attrition_numeric, 0) * 100, 2) AS FY_Attrition,
+    ROUND(COALESCE(qp.quarter_attrition_numeric, 0) * 100, 2) AS Quarter_Attrition,
+    ROUND(COALESCE(mp.month_attrition_numeric, 0) * 100, 2) AS Month_Attrition,
+
+    COALESCE(sc.Total_Employees, 0)        AS Total_Employees,
+    COALESCE(sc.Total_Resigned_Employee,0) AS Total_Resigned_Employee,
+
+    CASE
+      WHEN COALESCE(sc.Total_Employees, 0) = 0 THEN 0
+      ELSE ROUND(SAFE_DIVIDE(sc.Total_Resigned_Employee, sc.Total_Employees) * 100, 2)
+    END AS bucket_attrition,
+
+    g.Month_Sort,
+
+    IFNULL(p_gender,'All') AS gender_type,
+    IFNULL(p_function,'All') AS Function_Name,
+    IFNULL(p_department,'All') AS department_name,
+    IFNULL(p_designation,'All') AS designation_name,
+    IFNULL(p_location,'All') AS location_name,
+    IFNULL(p_employment_status,'All') AS employment_status
+
+  FROM grid g
+  LEFT JOIN month_pct  mp ON g.Tenure_Bucket = mp.Tenure_Bucket
+                         AND g.month_start = mp.month_start
+  LEFT JOIN quarter_pct qp ON g.Tenure_Bucket = qp.Tenure_Bucket
+                          AND g.FY = qp.FY
+                          AND g.Quarter = qp.Quarter
+  LEFT JOIN fy_pct      fp ON g.Tenure_Bucket = fp.Tenure_Bucket
+                          AND g.FY = fp.FY
+  LEFT JOIN simple_counts sc ON g.Tenure_Bucket = sc.Tenure_Bucket
+)
+
+SELECT *
+FROM final
+ORDER BY Tenure_Bucket, FY, Month_Sort
+);
