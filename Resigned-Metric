@@ -1,0 +1,156 @@
+CREATE OR REPLACE TABLE FUNCTION `pulse-dev-477810.KPIs.fn_resigned_metrics` (
+    p_fy STRING,
+    p_quarter STRING,
+    p_month STRING,
+    p_gender_type STRING,
+    p_function_name STRING,
+    p_department_name STRING,
+    p_designation_name STRING,
+    p_location_name STRING,
+    p_employment_status STRING,
+    p_regrettable_status STRING
+)
+RETURNS TABLE<
+    employee_id  STRING,
+    employee_name STRING,
+    joining_date DATE,
+    resigned_date DATE,
+    salary_band STRING,
+    reporting_manager STRING,
+    FY STRING,
+    CY INT64,
+    Quarter STRING,
+    Month_Name STRING,
+    gender_type STRING,
+    Function_Name STRING,
+    department_name STRING,
+    designation_name STRING,
+    location_name STRING,
+    employment_status STRING,
+    regrettable_status STRING,
+    Flag  INT64
+>
+AS (
+
+/**********************************************************
+ STEP 1 → Base (Fact + All Dimensions)
+**********************************************************/
+WITH base AS (
+    SELECT
+        fe.employee_id,
+        dem.employee_name,
+        dem.joining_date,
+        fe.resigned_date,
+        sb.salary_band,
+        dem.reporting_manager,
+
+        g.gender_type,
+        fn.Function_Name,
+        d.department_name,
+        ds.designation_name,
+        l.location_name,
+        es.employment_status,
+
+        fe.regrettable_status_id,
+        rgs.regrettable_status AS regrettable_status_name
+
+    FROM `pulse-dev-477810.gold.gl_fact_employee` fe
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_emp` dem ON fe.employee_id = dem.employee_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_salary_band` sb ON fe.salary_band_id = sb.salary_band_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_gender` g ON fe.gender_id = g.gender_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_functions` fn ON fe.function_id = fn.function_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_department` d ON fe.department_id = d.department_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_designation` ds ON fe.designation_id = ds.designation_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_location` l ON fe.location_id = l.location_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_employment_status` es ON fe.employment_status_id = es.employment_status_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_regrettable_status` rgs ON fe.regrettable_status_id = rgs.regrettable_status_id
+    WHERE fe.employment_status_id IN (2, 3)
+),
+
+/**********************************************************
+ STEP 2 → Calendar Join for FY, Quarter, Month
+**********************************************************/
+calculated AS (
+    SELECT
+        b.*,
+        c.FY AS FY_label,
+        c.Q AS Quarter,
+        c.Month AS Month_Name
+    FROM base b
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_calendar` c
+        ON b.resigned_date = c.Date
+),
+
+/**********************************************************
+ STEP 2A → Compute Current FY
+**********************************************************/
+current_fy AS (
+  SELECT DISTINCT FY AS current_fy_label
+  FROM `pulse-dev-477810.gold.gl_dim_calendar`
+  WHERE Date = CURRENT_DATE()
+),
+
+/**********************************************************
+ STEP 3 → Apply Filters (EXCLUDING FY / Q / M)
+**********************************************************/
+filtered AS (
+    SELECT *
+    FROM calculated
+    WHERE (p_gender_type IS NULL OR p_gender_type = 'All' OR gender_type = p_gender_type)
+      AND (p_function_name IS NULL OR p_function_name = 'All' OR Function_Name = p_function_name)
+      AND (p_department_name IS NULL OR p_department_name = 'All' OR department_name = p_department_name)
+      AND (p_designation_name IS NULL OR p_designation_name = 'All' OR designation_name = p_designation_name)
+      AND (p_location_name IS NULL OR p_location_name = 'All' OR location_name = p_location_name)
+      AND (p_employment_status IS NULL OR p_employment_status = 'All' OR employment_status = p_employment_status)
+      AND (p_regrettable_status IS NULL OR p_regrettable_status = 'All'
+           OR regrettable_status_name = p_regrettable_status)
+),
+
+/**********************************************************
+ STEP 4 → Final Output Before FY/Q/M Filter
+**********************************************************/
+final_output AS (
+    SELECT DISTINCT
+        employee_id,
+        employee_name,
+        joining_date,
+        resigned_date,
+        salary_band,
+        reporting_manager,
+        FY_label AS FY,
+        CASE WHEN FY_label = (SELECT current_fy_label FROM current_fy) THEN 1 ELSE 0 END AS CY,
+        Quarter,
+        Month_Name,
+        gender_type,
+        Function_Name,
+        department_name,
+        designation_name,
+        location_name,
+        employment_status,
+        regrettable_status_name AS regrettable_status
+    FROM filtered
+),
+
+-- ⭐ APPLY FY/Q/M FILTERS AT THE FINAL STEP ONLY
+final as (
+SELECT *
+FROM final_output
+WHERE (p_fy IS NULL OR p_fy = 'All' OR FY = p_fy)
+  AND (p_quarter IS NULL OR p_quarter = 'All' OR Quarter = p_quarter)
+  AND (p_month IS NULL OR p_month = 'All' OR Month_Name = p_month)
+ORDER BY FY, Quarter, Month_Name, employee_name
+) 
+SELECT 
+    f.*,
+    d_.Flag AS Flag
+FROM final f
+LEFT JOIN (
+    SELECT DISTINCT
+        FY,
+        Flag
+    FROM `pulse-dev-477810.gold.gl_dim_calendar`
+    WHERE Date IS NOT NULL
+) d_
+ON f.FY = d_.FY
+
+);
