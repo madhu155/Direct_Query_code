@@ -1,0 +1,104 @@
+CREATE OR REPLACE TABLE FUNCTION `pulse-dev-477810.KPIs.fn_feedback_metrics`(
+    p_fy                STRING,
+    p_quarter           STRING,
+    p_month             STRING,
+    p_gender            STRING,
+    p_function          STRING,
+    p_department        STRING,
+    p_designation       STRING,
+    p_location          STRING,
+    p_employment_status STRING
+)
+RETURNS TABLE < 
+    Question STRING,
+    Score INT64,
+    employee_id STRING,
+    Resigned_Date DATE,
+    FY STRING,
+    Quarter STRING,
+    Month STRING,
+    FY_Q STRING,
+    FY_Month STRING,
+    gender_type STRING,
+    Function_Name STRING,
+    department_name STRING,
+    designation_name STRING,
+    location_name STRING,
+    employment_status STRING
+>
+AS (
+WITH base AS (
+    SELECT
+        q.Question,
+        f.Score,
+        f.Employee_Id AS employee_id,
+        f.Resigned_Date,
+
+        /* Derived Time Fields */
+        FORMAT_DATE('%Y', f.Resigned_Date) AS fy_val,
+        CONCAT('Q', CAST(DIV(EXTRACT(MONTH FROM f.Resigned_Date)-1, 3) + 1 AS STRING)) AS quarter_val,
+        FORMAT_DATE('%B', f.Resigned_Date) AS month_val,
+        FORMAT_DATE('%B %Y', f.Resigned_Date) AS fy_month_val,
+        CONCAT(FORMAT_DATE('%Y', f.Resigned_Date), '-Q',
+               CAST(DIV(EXTRACT(MONTH FROM f.Resigned_Date)-1, 3) + 1 AS STRING)) AS fy_q_val,
+
+        /* Dimension fields */
+        g.gender_type,
+        fn.function_name,
+        d.department_name,
+        ds.designation_name,
+        l.location_name,
+        es.employment_status
+
+    FROM `pulse-dev-477810.gold.gl_fact_employee` f
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_feedback_question` q
+        ON f.question_id = q.question_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_gender` g
+        ON f.gender_id = g.gender_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_functions` fn
+        ON f.function_id = fn.function_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_department` d
+        ON f.department_id = d.department_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_designation` ds
+        ON f.designation_id = ds.designation_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_location` l
+        ON f.location_id = l.location_id
+    LEFT JOIN `pulse-dev-477810.gold.gl_dim_employment_status` es
+        ON f.employment_status_id = es.employment_status_id
+
+    WHERE f.question_id IS NOT NULL
+      AND f.Resigned_Date IS NOT NULL
+)
+
+SELECT
+    Question,
+    Score,
+    employee_id,
+    Resigned_Date,
+
+    /* PARAMETER COLUMNS → Show 'All' when parameter = All */
+    IF(p_fy = 'All', 'All', fy_val)                     AS FY,
+    IF(p_quarter = 'All', 'All', quarter_val)           AS Quarter,
+    IF(p_month = 'All', 'All', month_val)               AS Month,
+    IF(p_fy = 'All' OR p_quarter = 'All', 'All', fy_q_val) AS FY_Q,
+    IF(p_month = 'All', 'All', fy_month_val)            AS FY_Month,
+
+    IF(p_gender = 'All', 'All', gender_type)            AS gender_type,
+    IF(p_function = 'All', 'All', function_name)        AS Function_Name,
+    IF(p_department = 'All', 'All', department_name)    AS department_name,
+    IF(p_designation = 'All', 'All', designation_name)  AS designation_name,
+    IF(p_location = 'All', 'All', location_name)        AS location_name,
+    IF(p_employment_status = 'All', 'All', employment_status) AS employment_status
+
+FROM base
+WHERE
+      (p_fy = 'All' OR fy_val = p_fy)
+  AND (p_quarter = 'All' OR quarter_val = p_quarter)
+  AND (p_month = 'All' OR month_val = p_month)
+  AND (p_gender = 'All' OR gender_type = p_gender)
+  AND (p_function = 'All' OR function_name = p_function)
+  AND (p_department = 'All' OR department_name = p_department)
+  AND (p_designation = 'All' OR designation_name = p_designation)
+  AND (p_location = 'All' OR location_name = p_location)
+  AND (p_employment_status = 'All' OR employment_status = p_employment_status)
+);
