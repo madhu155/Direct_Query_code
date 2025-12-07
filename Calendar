@@ -1,0 +1,114 @@
+config {
+  type: "table",
+  schema: "gold",
+  name: "gl_dim_calendar",
+  tags: ["gold", "hr", "dim"]
+}
+
+/* -----------------------------------------------------
+   1. Determine Min Start Date and Max End Date
+------------------------------------------------------*/
+WITH date_range AS (
+  SELECT
+    MIN(Joining_Date) AS start_date,
+    MAX(COALESCE(Resigned_Date, CURRENT_DATE())) AS end_date
+  FROM ${ref("silver", "sl_hr_master_clean")}
+),
+
+/* -----------------------------------------------------
+   2. Generate Calendar
+------------------------------------------------------*/
+calendar AS (
+  SELECT day AS calendar_date
+  FROM UNNEST(
+    GENERATE_DATE_ARRAY(
+      (SELECT start_date FROM date_range),
+      (SELECT end_date FROM date_range),
+      INTERVAL 1 DAY
+    )
+  ) AS day
+),
+
+/* -----------------------------------------------------
+   3. Compute FY, Current FY for flag
+------------------------------------------------------*/
+fy_flags AS (
+  SELECT
+    calendar_date,
+
+    CASE
+      WHEN EXTRACT(MONTH FROM calendar_date) >= 4
+        THEN EXTRACT(YEAR FROM calendar_date)
+      ELSE EXTRACT(YEAR FROM calendar_date) - 1
+    END AS fy_start_year,
+
+    CASE
+      WHEN EXTRACT(MONTH FROM CURRENT_DATE()) >= 4
+        THEN EXTRACT(YEAR FROM CURRENT_DATE())
+      ELSE EXTRACT(YEAR FROM CURRENT_DATE()) - 1
+    END AS current_fy_start_year
+  FROM calendar
+)
+
+/* -----------------------------------------------------
+   4. Final Output with FIRST ROW = ALL
+------------------------------------------------------*/
+SELECT *
+FROM (
+
+  /* ---- MAIN CALENDAR ROWS ---- */
+  SELECT
+    calendar_date AS Date,
+    EXTRACT(YEAR FROM calendar_date) AS Year,
+    FORMAT_DATE('%B', calendar_date) AS Month,
+    EXTRACT(DAY FROM calendar_date) AS day_of_month,
+
+    /* FISCAL YEAR (FY-YY-YY) */
+    CONCAT(
+      'FY-',
+      SUBSTR(CAST(fy_start_year AS STRING), 3, 2),
+      '-',
+      SUBSTR(CAST(fy_start_year + 1 AS STRING), 3, 2)
+    ) AS FY,
+
+    /* QUARTER (APR-MAR) */
+    CASE
+      WHEN EXTRACT(MONTH FROM calendar_date) BETWEEN 4 AND 6 THEN 'Q1'
+      WHEN EXTRACT(MONTH FROM calendar_date) BETWEEN 7 AND 9 THEN 'Q2'
+      WHEN EXTRACT(MONTH FROM calendar_date) BETWEEN 10 AND 12 THEN 'Q3'
+      ELSE 'Q4'
+    END AS Q,
+
+    DATE_TRUNC(calendar_date, MONTH) AS month_start,
+    LAST_DAY(calendar_date, MONTH) AS month_end,
+
+    CASE WHEN calendar_date = LAST_DAY(calendar_date, MONTH)
+         THEN TRUE ELSE FALSE END AS is_month_end,
+
+    /* FLAG (1 = Current FY, 2 = Previous FY, 0 = Others) */
+    CASE
+      WHEN fy_start_year = current_fy_start_year THEN 1
+      WHEN fy_start_year = current_fy_start_year - 1 THEN 2
+      ELSE 0
+    END AS Flag
+
+  FROM fy_flags
+
+  UNION ALL
+
+  /* ---- FIRST ROW WITH ONLY (Month, FY, Q) = ALL ---- */
+  SELECT
+    NULL AS Date,
+    NULL AS Year,
+    'All' AS Month,
+    NULL AS day_of_month,
+    'All' AS FY,
+    'All' AS Q,
+    NULL AS month_start,
+    NULL AS month_end,
+    NULL AS is_month_end,
+    NULL AS Flag
+
+)
+
+ORDER BY Date IS NULL DESC, Date
